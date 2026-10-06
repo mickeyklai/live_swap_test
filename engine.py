@@ -96,6 +96,25 @@ def largest_face(faces):
     return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
 
+def pick_tracked_face(faces, prev_bbox, min_iou: float = 0.25):
+    """Keep locking the same person. Never jump to a larger stranger in-frame."""
+    if not faces:
+        return None
+    if prev_bbox is None:
+        return largest_face(faces)
+    best = None
+    best_iou = -1.0
+    for face in faces:
+        iou = bbox_iou(prev_bbox, face.bbox)
+        if iou > best_iou:
+            best_iou = iou
+            best = face
+    if best is not None and best_iou >= min_iou:
+        return best
+    # Another person may be largest now — refuse to retarget; caller will privacy-hold.
+    return None
+
+
 def open_camera(index: int, width: int, height: int):
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     cap = cv2.VideoCapture(index, backend)
@@ -269,6 +288,41 @@ def soft_paste_back(target_img, bgr_fake, M):
 
     out = warped_mask * warped_f + (1.0 - warped_mask) * target_f
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def no_signal_frame(h: int, w: int) -> np.ndarray:
+    """Dark static frame — reads as a dropped connection, not face censorship."""
+    out = np.full((h, w, 3), 30, dtype=np.uint8)
+    noise = np.random.randint(0, 22, (h, w, 1), dtype=np.uint8)
+    out = np.clip(out.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    out[::5, :, :] = np.clip(out[::5, :, :].astype(np.int16) - 10, 0, 255).astype(np.uint8)
+    return out
+
+
+def privacy_hold_frame(last_safe, shape, tick: int = 0) -> np.ndarray:
+    """Elegant privacy fallback: freeze last good swap (Zoom-style lag).
+
+    Never blurs a live face region — that looks intentional. If we have never
+    produced a safe swapped frame, show connection-lost static instead.
+    """
+    if last_safe is not None and last_safe.shape[:2] == (shape[0], shape[1]):
+        out = last_safe.copy()
+        # Occasional mild macroblock streak — looks like codec lag, not a privacy blur.
+        if tick % 19 == 0:
+            h, w = out.shape[:2]
+            bh, bw = 20, 36
+            y0 = (tick * 11) % max(1, h - bh)
+            x0 = (tick * 17) % max(1, w - bw)
+            patch = out[y0 : y0 + bh, x0 : x0 + bw]
+            if patch.size:
+                tiny = cv2.resize(patch, (4, 3), interpolation=cv2.INTER_LINEAR)
+                out[y0 : y0 + bh, x0 : x0 + bw] = cv2.resize(
+                    tiny, (bw, bh), interpolation=cv2.INTER_NEAREST
+                )
+        return out
+    if last_safe is not None:
+        return cv2.resize(last_safe, (shape[1], shape[0]))
+    return no_signal_frame(shape[0], shape[1])
 
 
 def swap_face(frame, target_face, source_face, swapper):
@@ -586,8 +640,12 @@ class SwapEngine:
     def _worker_loop(self):
         smoother = LandmarkSmoother(alpha=0.60)
         cached = None
+        detected_faces = []
         miss_hold = 0
         miss_hold_max = 10
+        last_safe = None  # last successfully swapped frame (no real face)
+        last_bbox = None
+        safe_hold = 0
         frame_i = 0
         fps = 0.0
         prev = time.perf_counter()
@@ -603,13 +661,25 @@ class SwapEngine:
 
             if cached is None or frame_i % self.det_every == 0:
                 faces = self.detect_app.get(frame)
-                if faces:
-                    face = largest_face(faces)
-                    # Rare largest-face jump: reset smoother so identity track does not teleport.
-                    if cached is not None and bbox_iou(cached.bbox, face.bbox) < 0.15:
-                        smoother.reset()
-                    cached = smoother.update(face)
-                    miss_hold = 0
+                detected_faces = list(faces) if faces else []
+                if detected_faces:
+                    # Stick to the same person — do not retarget to a larger bystander.
+                    face = pick_tracked_face(
+                        detected_faces,
+                        cached.bbox if cached is not None else last_bbox,
+                        min_iou=0.25,
+                    )
+                    if face is not None:
+                        cached = smoother.update(face)
+                        last_bbox = cached.bbox.copy()
+                        miss_hold = 0
+                    else:
+                        # Faces present but none match our track (bystander stole largest).
+                        miss_hold += 1
+                        if miss_hold > miss_hold_max:
+                            cached = None
+                            smoother.reset()
+                            miss_hold = 0
                 else:
                     # Hold last landmarks briefly (blink / blur) instead of hard pop-out.
                     miss_hold += 1
@@ -617,8 +687,10 @@ class SwapEngine:
                         cached = None
                         smoother.reset()
                         miss_hold = 0
+                        detected_faces = []
 
             source, source_name, source_id, _gen = self.get_active_face()
+            swapped = False
             if cached is not None and source is not None:
                 try:
                     if getattr(source, "embedding", None) is None and getattr(source, "normed_embedding", None) is None:
@@ -626,8 +698,23 @@ class SwapEngine:
                     frame = swap_on_roi(
                         frame, cached, source, self.swapper, margin=self.roi_margin
                     )
+                    swapped = True
+                    last_safe = frame.copy()
+                    last_bbox = cached.bbox.copy()
+                    safe_hold = 0
                 except Exception as exc:
                     self._status = f"swap error: {exc}"
+                    swapped = False
+
+            # Privacy: freeze last good swap (looks like lag), never live face-blur.
+            if not swapped:
+                safe_hold += 1
+                frame = privacy_hold_frame(last_safe, frame.shape, tick=frame_i)
+                self._status = (
+                    "privacy: holding last swap"
+                    if last_safe is not None
+                    else "privacy: no signal"
+                )
 
             now = time.perf_counter()
             dt = now - prev
