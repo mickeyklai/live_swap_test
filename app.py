@@ -33,7 +33,7 @@ class FaceSwapApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        self.engine = SwapEngine(width=PREVIEW_W, height=PREVIEW_H, det_every=3)
+        self.engine = SwapEngine(width=PREVIEW_W, height=PREVIEW_H, det_every=1)
         self.portraits = []
         self._photo = None
         self._selected_btn = None

@@ -141,9 +141,9 @@ class CameraStream:
 
 
 class LandmarkSmoother:
-    """EMA on the 5 alignment landmarks (and bbox) to reduce glasses flicker."""
+    """EMA on the 5 alignment landmarks (and bbox) to reduce flicker without lag."""
 
-    def __init__(self, alpha: float = 0.7):
+    def __init__(self, alpha: float = 0.60):
         self.alpha = float(alpha)
         self.kps = None
         self.bbox = None
@@ -165,6 +165,22 @@ class LandmarkSmoother:
         return Face(bbox=self.bbox.copy(), kps=self.kps.copy(), det_score=getattr(face, "det_score", 1.0))
 
 
+def bbox_iou(a, b) -> float:
+    """Intersection-over-union for two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    return float(inter / denom) if denom > 0.0 else 0.0
+
+
 def shift_face_into_roi(face, x0, y0):
     bbox = face.bbox.astype(np.float32).copy()
     bbox[0] -= x0
@@ -184,7 +200,7 @@ def soft_paste_back(target_img, bgr_fake, M):
 
     Stock paste_back uses borderValue=0 and a hard |fake-diff| mask, which paints thin
     black strokes when landmarks jitter during head motion. We warp with BORDER_REPLICATE
-    and a soft face ellipse only.
+    and a soft face ellipse, then mean-match BGR tone under the mask.
     """
     im = cv2.invertAffineTransform(M)
     th, tw = target_img.shape[:2]
@@ -194,24 +210,19 @@ def soft_paste_back(target_img, bgr_fake, M):
     cv2.ellipse(
         mask,
         (size // 2, int(size * 0.48)),
-        (int(size * 0.44), int(size * 0.56)),
+        (int(size * 0.46), int(size * 0.58)),
         0,
         0,
         360,
         1.0,
         -1,
     )
-    # Soften the outer rim so motion cannot leave hard black edges.
-    k = max((size // 6) | 1, 11)
-    if k % 2 == 0:
-        k += 1
-    mask = cv2.GaussianBlur(mask, (k, k), 0)
-    # Zero a thin outer ring so warped black/empty texels never composite in.
+    # Mild outer ring so empty/edge texels stay out without shrinking coverage much.
     ring = np.zeros_like(mask)
     cv2.ellipse(
         ring,
         (size // 2, int(size * 0.48)),
-        (int(size * 0.48), int(size * 0.60)),
+        (int(size * 0.50), int(size * 0.62)),
         0,
         0,
         360,
@@ -219,6 +230,10 @@ def soft_paste_back(target_img, bgr_fake, M):
         -1,
     )
     mask *= ring
+    # Single shorter blur — double blur caused rim shimmer / over-soft halo.
+    k = max((size // 8) | 1, 9)
+    if k % 2 == 0:
+        k += 1
     mask = cv2.GaussianBlur(mask, (k, k), 0)
 
     warped = cv2.warpAffine(
@@ -240,6 +255,18 @@ def soft_paste_back(target_img, bgr_fake, M):
 
     target_f = target_img.astype(np.float32)
     warped_f = warped.astype(np.float32)
+
+    # Match mean BGR of swapped face to live skin under the mask (reduces pasted-on rim).
+    solid = warped_mask[..., 0] > 0.05
+    if np.any(solid):
+        w = warped_mask[..., 0]
+        w_sum = float(w[solid].sum())
+        if w_sum > 1e-3:
+            mean_src = (warped_f[solid] * w[solid][:, None]).sum(axis=0) / w_sum
+            mean_dst = (target_f[solid] * w[solid][:, None]).sum(axis=0) / w_sum
+            scale = np.clip(mean_dst / np.maximum(mean_src, 1.0), 0.85, 1.15)
+            warped_f = warped_f * scale.reshape(1, 1, 3)
+
     out = warped_mask * warped_f + (1.0 - warped_mask) * target_f
     return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -262,7 +289,7 @@ def _roi_feather_mask(h: int, w: int, border: int) -> np.ndarray:
     return mask[..., None]
 
 
-def swap_on_roi(frame, target_face, source_face, swapper, margin: float = 0.45):
+def swap_on_roi(frame, target_face, source_face, swapper, margin: float = 0.55):
     x1, y1, x2, y2 = target_face.bbox.astype(int)
     fw = max(1, x2 - x1)
     fh = max(1, y2 - y1)
@@ -279,7 +306,8 @@ def swap_on_roi(frame, target_face, source_face, swapper, margin: float = 0.45):
     crop = np.ascontiguousarray(frame[y0:y1c, x0:x1c])
     swapped = swap_face(crop, shift_face_into_roi(target_face, x0, y0), source_face, swapper)
     roi_h, roi_w = swapped.shape[:2]
-    feather = _roi_feather_mask(roi_h, roi_w, border=max(10, min(roi_h, roi_w) // 12))
+    # Gentler rectangular feather so head turns do not show a boxy halo.
+    feather = _roi_feather_mask(roi_h, roi_w, border=max(8, min(roi_h, roi_w) // 16))
     base = frame[y0:y1c, x0:x1c].astype(np.float32)
     blended = feather * swapped.astype(np.float32) + (1.0 - feather) * base
     frame[y0:y1c, x0:x1c] = np.clip(blended, 0, 255).astype(np.uint8)
@@ -348,8 +376,8 @@ class SwapEngine:
         camera: int = 0,
         width: int = 640,
         height: int = 480,
-        det_every: int = 3,
-        roi_margin: float = 0.45,
+        det_every: int = 1,
+        roi_margin: float = 0.55,
         prefer_fp16: bool = True,
         use_trt: bool = False,
         cpu_only: bool = False,
@@ -404,7 +432,7 @@ class SwapEngine:
         self.detect_app = FaceAnalysis(
             name="buffalo_l", allowed_modules=["detection"], providers=self.providers
         )
-        self.detect_app.prepare(ctx_id=0, det_size=(320, 320))
+        self.detect_app.prepare(ctx_id=0, det_size=(480, 480))
 
         print("[engine] loading inswapper...", flush=True)
         self.swapper = load_swapper(self.providers, prefer_fp16=self.prefer_fp16)
@@ -556,8 +584,10 @@ class SwapEngine:
             self._vcam_status = f"Virtual camera send error: {exc}"
 
     def _worker_loop(self):
-        smoother = LandmarkSmoother(alpha=0.8)
+        smoother = LandmarkSmoother(alpha=0.60)
         cached = None
+        miss_hold = 0
+        miss_hold_max = 10
         frame_i = 0
         fps = 0.0
         prev = time.perf_counter()
@@ -574,10 +604,19 @@ class SwapEngine:
             if cached is None or frame_i % self.det_every == 0:
                 faces = self.detect_app.get(frame)
                 if faces:
-                    cached = smoother.update(largest_face(faces))
+                    face = largest_face(faces)
+                    # Rare largest-face jump: reset smoother so identity track does not teleport.
+                    if cached is not None and bbox_iou(cached.bbox, face.bbox) < 0.15:
+                        smoother.reset()
+                    cached = smoother.update(face)
+                    miss_hold = 0
                 else:
-                    cached = None
-                    smoother.reset()
+                    # Hold last landmarks briefly (blink / blur) instead of hard pop-out.
+                    miss_hold += 1
+                    if miss_hold > miss_hold_max:
+                        cached = None
+                        smoother.reset()
+                        miss_hold = 0
 
             source, source_name, source_id, _gen = self.get_active_face()
             if cached is not None and source is not None:
